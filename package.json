@@ -1,0 +1,59 @@
+{
+  "name": "dsh-wechat-bridge",
+  "version": "1.4.3",
+  "description": "通到微信：DSH 里的 AI 伙伴和微信双向互通。读微信本地库收消息、UI 自动化发消息。外人只能聊天（工具被硬拦，不能执行命令、不能读写文件）；可配入站白名单限制谁能发消息进来。",
+  "license": "MIT",
+  "type": "module",
+  "main": "lib/host.js",
+  "exports": {
+    ".": "./lib/host.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "bridge",
+    "cordis.patch.yml",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "slots"
+      ],
+      "external": [
+        "react"
+      ]
+    }
+  },
+  "keywords": [
+    "deepseek-harness",
+    "dsh-plugin",
+    "wechat",
+    "weixin",
+    "wechatauto",
+    "bridge"
+  ],
+  "author": "Yuuyuko-uu",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/xiao-peng-16/dsh-wechat-bridge-bot.git"
+  },
+  "homepage": "https://github.com/xiao-peng-16/dsh-wechat-bridge-bot#readme",
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
+  "contributors": [
+    {
+      "name": "thawline",
+      "url": "https://github.com/thawline"
+    }
+  ]
+}
