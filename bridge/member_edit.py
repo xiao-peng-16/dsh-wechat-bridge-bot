@@ -1,193 +1,169 @@
 # -*- coding: utf-8 -*-
-"""查 / 改「群友信息表.xlsx」。
-
-宿主用 stdin 传 JSON；所有定位均按表头映射，不依赖列顺序。旧表头“昵称”只用于兼容读取。
-"""
+"""Query and update structured member details in the bridge memory SQLite database."""
 
 import json
 import os
+import sqlite3
 import sys
+import time
 
-允许字段 = [
+FIELDS = [
     "微信昵称", "年龄_出生年份", "性别", "星座", "MBTI", "地区", "身高",
     "学历", "职业", "个人信息", "理想型", "大肥鱼对用户印象", "补充", "是否有对象", "群昵称",
 ]
-默认返回列 = ["微信昵称", "年龄_出生年份", "性别", "地区", "理想型", "是否有对象"]
+DEFAULT_FIELDS = ["微信昵称", "年龄_出生年份", "性别", "地区", "理想型", "是否有对象", "群昵称"]
 
 
-def 读表头(ws):
-    return {str(c.value or "").strip(): i for i, c in enumerate(ws[1]) if str(c.value or "").strip()}
+def connect(path):
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    con = sqlite3.connect(path, timeout=10)
+    con.row_factory = sqlite3.Row
+    con.execute(
+        "CREATE TABLE IF NOT EXISTS member_details("
+        "account TEXT, member_id TEXT, name TEXT DEFAULT '', details TEXT DEFAULT '{}',"
+        "updated_at REAL DEFAULT 0, PRIMARY KEY(account, member_id))"
+    )
+    return con
 
 
-def 微信昵称列(hdr):
-    return hdr.get("微信昵称", hdr.get("昵称"))
-
-
-def 取列值(cells, hdr, 列):
-    i = hdr.get(列)
-    if i is None:
-        return ""
-    if i >= len(cells):
-        return ""
-    return str(cells[i] or "").strip()
-
-
-def 找行(ws, 名):
-    try:
-        from .member_identity import find_member_row
-    except ImportError:
-        from member_identity import find_member_row
-    hdr = 读表头(ws)
-    # The tool accepts one selector; check it against all three fields in order.
-    for kwargs in ({'wxid': 名}, {'wechat_nickname': 名}, {'group_nickname': 名}):
-        row_number = find_member_row(ws, **kwargs)
-        if row_number is not None:
-            return ws[row_number], hdr
-    return None, hdr
-
-
-def 年份数(s):
-    s = str(s or "").strip()
-    if not s.isdigit():
+def year_number(value):
+    value = str(value or "").strip()
+    if not value.isdigit():
         return None
-    n = int(s)
-    return 1900 + n if n < 100 and n >= 70 else 2000 + n if n < 100 else n
+    number = int(value)
+    return 1900 + number if 70 <= number < 100 else 2000 + number if number < 100 else number
 
 
-def 查(ws, 筛选, 要的列, 上限):
-    hdr = 读表头(ws)
-    返回列 = [x for x in 要的列 if x in hdr] or [x for x in 默认返回列 if x in hdr]
-    性别 = 筛选.get("性别") or ""
-    地区 = 筛选.get("地区") or ""
-    有对象 = 筛选.get("有对象") or ""
-    年份从 = str(筛选.get("年份从") or "").strip()
-    年份到 = str(筛选.get("年份到") or "").strip()
-    关键词 = 筛选.get("关键词") or ""
-    结果, 扫描 = [], 0
-    for 行号, row in enumerate(ws.iter_rows(min_row=2), start=2):
-        cells = [c.value for c in row]
-        昵称 = 取列值(cells, hdr, "微信昵称") or 取列值(cells, hdr, "昵称")
-        if not 昵称:
+def query(con, account, filters, fields, limit):
+    rows = con.execute(
+        "SELECT member_id,name,details FROM member_details WHERE account=? ORDER BY name,member_id",
+        (account,),
+    ).fetchall()
+    output_fields = [field for field in fields if field in FIELDS] or DEFAULT_FIELDS
+    results = []
+    scanned = 0
+    for row in rows:
+        try:
+            details = json.loads(row["details"] or "{}")
+        except (TypeError, ValueError):
+            details = {}
+        item = {"wxid": row["member_id"], "微信昵称": row["name"] or details.get("微信昵称", "")}
+        item.update(details)
+        if not item.get("微信昵称"):
             continue
-        扫描 += 1
-        性别值 = 取列值(cells, hdr, "性别")
-        地区值 = 取列值(cells, hdr, "地区")
-        对象值 = 取列值(cells, hdr, "是否有对象")
-        年份 = 取列值(cells, hdr, "年龄_出生年份")
-        if 性别 and 性别值 != 性别:
+        scanned += 1
+        if filters.get("性别") and item.get("性别") != filters["性别"]:
             continue
-        if 地区 and 地区 not in 地区值:
+        if filters.get("地区") and filters["地区"] not in str(item.get("地区", "")):
             continue
-        if 有对象 == "有" and 对象值 != "有":
+        if filters.get("有对象") == "有" and item.get("是否有对象") != "有":
             continue
-        if 有对象 == "无" and 对象值 == "有":
+        if filters.get("有对象") == "无" and item.get("是否有对象") == "有":
             continue
-        if 年份从 and not (年份数(年份) and 年份数(年份) >= 年份数(年份从)):
+        low = year_number(filters.get("年份从"))
+        high = year_number(filters.get("年份到"))
+        year = year_number(item.get("年龄_出生年份"))
+        if low is not None and (year is None or year < low):
             continue
-        if 年份到 and not (年份数(年份) and 年份数(年份) <= 年份数(年份到)):
+        if high is not None and (year is None or year > high):
             continue
-        if 关键词:
-            values = [昵称] + [取列值(cells, hdr, k) for k in ("个人信息", "理想型", "补充", "职业", "群昵称")]
-            if 关键词 not in " ".join(values):
-                continue
-        item = {k: 取列值(cells, hdr, k) for k in 返回列}
-        item["行"] = 行号
-        结果.append(item)
-    超了 = len(结果) > 上限
-    return (结果[:上限] if 超了 else 结果), 扫描, 超了
-
-
-def 摘要(结果, 列):
-    行们 = []
-    for i, 项 in enumerate(结果, 1):
-        parts = []
-        for k in 列:
-            v = 项.get(k) or ""
-            if k == "理想型":
-                v = v[:24]
-            if v:
-                parts.append("%s:%s" % (k, v))
-        行们.append("%d. %s" % (i, "｜".join(parts)))
-    return "\n".join(行们)
+        keyword = str(filters.get("关键词") or "")
+        if keyword and keyword not in " ".join(str(item.get(key, "")) for key in
+                                                ("微信昵称", "群昵称", "个人信息", "理想型", "补充", "职业")):
+            continue
+        results.append({key: item.get(key, "") for key in output_fields if key == "wxid" or key in FIELDS})
+    return results[:limit], scanned, len(results), len(results) > limit
 
 
 def main():
+    con = None
     try:
-        d = json.load(sys.stdin)
-    except Exception as e:
-        print(json.dumps({"ok": False, "说": "参数不是 JSON：%r" % e}, ensure_ascii=False))
-        return 1
-    表 = str(d.get("表") or "").strip()
-    动作 = str(d.get("动作") or "").strip()
-    if not 表 or not os.path.isfile(表):
-        print(json.dumps({"ok": False, "说": "表格不存在：%s" % 表}, ensure_ascii=False))
-        return 1
-    try:
-        import openpyxl
-    except Exception as e:
-        print(json.dumps({"ok": False, "说": "这台机器没装 openpyxl：%r" % e}, ensure_ascii=False))
-        return 1
+        request = json.load(sys.stdin)
+        database = str(request.get("数据库") or "").strip()
+        account = str(request.get("账号") or "").strip()
+        action = str(request.get("动作") or "").strip()
+        if not database or not account:
+            raise ValueError("缺少记忆数据库或微信账号")
+        con = connect(database)
+        if action in ("查", "query", "list", "search"):
+            filters = request.get("筛选") or {}
+            if not isinstance(filters, dict):
+                filters = {}
+            fields = request.get("字段") or []
+            if isinstance(fields, str):
+                fields = [part.strip() for part in fields.replace("，", ",").split(",") if part.strip()]
+            limit = max(1, min(int(request.get("上限") or 30), 200))
+            results, scanned, matched, truncated = query(con, account, filters, fields, limit)
+            con.close()
+            con = None
+            conditions = "、".join("%s=%s" % pair for pair in filters.items() if pair[1]) or "全部"
+            header = "共查 %d 人，命中 %d 人（%s）" % (scanned, matched, conditions)
+            if truncated:
+                header += "，只列前 %d 个" % limit
+            lines = []
+            for index, item in enumerate(results, 1):
+                values = ["%s:%s" % (key, str(item.get(key) or "")[:24] if key == "理想型" else item.get(key))
+                          for key in (fields or DEFAULT_FIELDS) if item.get(key)]
+                lines.append("%d. %s" % (index, "｜".join(values)))
+            print(json.dumps({"ok": True, "说": header + "\n" + ("\n".join(lines) or "（一个都没命中）"),
+                              "人数": matched, "行": results}, ensure_ascii=False))
+            return 0
 
-    if 动作 in ("查", "query", "list", "search"):
-        wb = openpyxl.load_workbook(表, read_only=True)
-        ws = wb.active
-        筛选 = d.get("筛选") or {}
-        if not isinstance(筛选, dict):
-            筛选 = {}
-        要的列 = d.get("字段") or []
-        if isinstance(要的列, str):
-            要的列 = [x.strip() for x in 要的列.replace("，", ",").split(",") if x.strip()]
-        try:
-            上限 = max(1, min(int(d.get("上限") or 30), 200))
-        except Exception:
-            上限 = 30
-        结果, 扫描, 超了 = 查(ws, 筛选, 要的列, 上限)
-        wb.close()
-        条件文 = "、".join("%s=%s" % (k, v) for k, v in 筛选.items() if v) or "全部"
-        头 = "共扫 %d 人，命中 %d 人（%s）" % (扫描, len(结果), 条件文)
-        if 超了:
-            头 += "，只列前 %d 个" % 上限
-        输出列 = [x for x in (要的列 or 默认返回列) if x]
-        正文 = 摘要(结果, 输出列) if 结果 else "（一个都没命中）"
-        print(json.dumps({"ok": True, "说": 头 + "\n" + 正文, "人数": len(结果), "行": 结果}, ensure_ascii=False))
+        member_id = str(request.get("名") or "").strip()
+        if not request.get("主人"):
+            raise ValueError("成员资料修改仅允许宿主授权")
+        field = str(request.get("字段") or "").strip()
+        value = str(request.get("值") or "").strip()
+        mode = str(request.get("模式") or "update").strip().lower()
+        if not member_id:
+            raise ValueError("缺「名」（微信昵称或 wxid）")
+        if field not in FIELDS or field == "微信昵称":
+            raise ValueError("这一列不能改：%s（可改：%s）" % (field, "、".join(x for x in FIELDS if x != "微信昵称")))
+        if not value:
+            raise ValueError("值不能是空")
+        row = con.execute(
+            "SELECT member_id,name,details FROM member_details WHERE account=? AND member_id=?",
+            (account, member_id),
+        ).fetchone()
+        if row is None:
+            matches = con.execute(
+                "SELECT member_id,name,details FROM member_details WHERE account=? AND name=? LIMIT 2",
+                (account, member_id),
+            ).fetchall()
+            if len(matches) > 1:
+                raise ValueError("微信昵称「%s」有重名，请使用 wxid" % member_id)
+            row = matches[0] if matches else None
+        if row is None and mode != "upsert":
+            raise ValueError("记忆库里没有「%s」；要新增请带 upsert，且必须提供 wxid" % member_id)
+        if row is None:
+            if not member_id.startswith("wxid_"):
+                raise ValueError("新增资料必须用微信 wxid 作为昵称参数")
+            name = member_id
+            details = {}
+            actual_id = member_id
+        else:
+            name = row["name"] or member_id
+            actual_id = row["member_id"]
+            try:
+                details = json.loads(row["details"] or "{}")
+            except (TypeError, ValueError):
+                details = {}
+        details[field] = value
+        con.execute(
+            "INSERT INTO member_details(account,member_id,name,details,updated_at) VALUES(?,?,?,?,?) "
+            "ON CONFLICT(account,member_id) DO UPDATE SET name=excluded.name,details=excluded.details,updated_at=excluded.updated_at",
+            (account, actual_id, name, json.dumps(details, ensure_ascii=False), time.time()),
+        )
+        con.commit()
+        con.close()
+        con = None
+        print(json.dumps({"ok": True, "说": "%s 的「%s」改好了" % (name, field), "wxid": actual_id}, ensure_ascii=False))
         return 0
-
-    名 = str(d.get("名") or "").strip()
-    字段 = str(d.get("字段") or "").strip()
-    值 = str(d.get("值") or "").strip()
-    模式 = str(d.get("模式") or "update").strip().lower()
-    if not 名:
-        print(json.dumps({"ok": False, "说": "缺「名」（微信昵称或 wxid）"}, ensure_ascii=False))
+    except Exception as error:
+        if con is not None:
+            con.close()
+        print(json.dumps({"ok": False, "说": str(error)}, ensure_ascii=False))
         return 1
-    if 字段 not in 允许字段:
-        print(json.dumps({"ok": False, "说": "这一列不能改：%s（能改：%s）" % (字段, "、".join(允许字段))}, ensure_ascii=False))
-        return 1
-    if 字段 == "微信昵称" and 模式 != "upsert":
-        print(json.dumps({"ok": False, "说": "微信昵称是匹配字段，不直接覆盖；要加叫法用「 / 」拼在值里、或先 upsert"}, ensure_ascii=False))
-        return 1
-    if not 值:
-        print(json.dumps({"ok": False, "说": "值不能是空"}, ensure_ascii=False))
-        return 1
-
-    wb = openpyxl.load_workbook(表)
-    ws = wb.active
-    row, hdr = 找行(ws, 名)
-    nick_col = 微信昵称列(hdr)
-    wxid_col = hdr.get("wxid")
-    if row is None:
-        if 模式 != "upsert":
-            print(json.dumps({"ok": False, "说": "表里没有「%s」这一行；要新增就带 upsert" % 名}, ensure_ascii=False))
-            return 1
-        row = ws[ws.max_row + 1]
-        if nick_col is not None:
-            row[nick_col].value = 名
-    if 字段 not in hdr:
-        print(json.dumps({"ok": False, "说": "表里没有「%s」这一列" % 字段}, ensure_ascii=False))
-        return 1
-    row[hdr[字段]].value = 值
-    wb.save(表)
-    print(json.dumps({"ok": True, "说": "%s 的「%s」改好了" % (名, 字段), "行": row[0].row}, ensure_ascii=False))
-    return 0
 
 
 if __name__ == "__main__":

@@ -1,77 +1,80 @@
-"""Regression: workbook columns may move without mixing names or profile fields."""
-import ast
+"""Regression tests for SQLite-backed member details (no workbook access)."""
 import contextlib
 import io
 import json
+import sqlite3
+import sys
 import tempfile
 from pathlib import Path
-from openpyxl import Workbook, load_workbook
+
 from bridge import member_edit
-import sys
-sys.path.insert(0, str(Path('bridge').resolve()))
-from bridge.member_identity import find_member_row
 
 
 def run():
-    probe = Workbook().active
-    probe.append(['wxid', '群昵称', '微信昵称'])
-    probe.append(['id_a', '同名', '甲'])
-    probe.append(['id_b', '乙群名', '同名'])
-    probe.append([None, '丙群名', '丙'])
-    assert find_member_row(probe, 'id_a', '同名', '丙群名') == 2
-    assert find_member_row(probe, wechat_nickname='同名', group_nickname='同名') == 3
-    assert find_member_row(probe, group_nickname='丙群名') == 4
-    assert find_member_row(probe, 'id_new', '甲', '同名') is None
-    probe.append([None, '丁群名', '丙'])
-    try:
-        find_member_row(probe, wechat_nickname='丙')
-    except ValueError:
-        pass
-    else:
-        raise AssertionError('Ambiguous names must not select the first row')
     with tempfile.TemporaryDirectory() as tmp:
-        path = Path(tmp) / 'members.xlsx'
-        wb = Workbook()
-        ws = wb.active
-        ws.append(['wxid', '群昵称', '微信昵称', '星座', '性别'])
-        ws.append(['wxid_one', '群内名', '原名 / 别名', '', '女'])
-        wb.save(path)
-        assert member_edit.找行(ws, '别名')[0][0].value == 'wxid_one'
-        results, _, _ = member_edit.查(ws, {'关键词': '群内名'}, [], 30)
-        assert results[0]['微信昵称'] == '原名 / 别名'
-        for name, mode in [('wxid_one', 'update'), ('新人', 'upsert')]:
-            payload = {'表': str(path), '名': name, '字段': '星座', '值': '天秤座', '模式': mode}
-            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-                import sys
-                previous = sys.stdin
-                try:
-                    sys.stdin = io.StringIO(json.dumps(payload))
-                    assert member_edit.main() == 0
-                finally:
-                    sys.stdin = previous
-        saved = load_workbook(path)
-        assert saved.active['B2'].value == '群内名'
-        assert saved.active['C2'].value == '原名 / 别名'
-        assert saved.active['D2'].value == '天秤座'
-        assert saved.active['C3'].value == '新人'
-        assert saved.active['D3'].value == '天秤座'
-        # Execute the bridge's actual nested updater against the same reordered workbook.
-        tree = ast.parse(Path('bridge/wechat_bridge.py').read_text(encoding='utf-8'))
-        function = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == '_改群友资料')
-        import re
-        import time
-        env = {'os': __import__('os'), 're': re, 'time': time, '_群友表路径': lambda: str(path),
-               '_星名们': ['天秤'], '_MBTI_RE': re.compile(r'(?!)'), 'log': lambda *args: None}
-        exec(compile(ast.Module(body=[function], type_ignores=[]), '<bridge-updater>', 'exec'), env)
-        env['_改群友资料']('wxid_one', '别名', '', '新群名')
-        saved = load_workbook(path)
-        assert saved.active['B2'].value == '新群名'
-        assert saved.active['C2'].value == '原名 / 别名'
-        env['_改群友资料']('wxid_two', '微信新名', '', '群新名')
-        saved = load_workbook(path)
-        assert [saved.active.cell(4,c).value for c in range(1,4)] == ['wxid_two', '群新名', '微信新名']
-    print('Member-column query/update/upsert and bridge regression passed')
+        db = Path(tmp) / "memory.db"
+        con = member_edit.connect(str(db))
+        con.execute(
+            "INSERT INTO member_details(account,member_id,name,details) VALUES(?,?,?,?)",
+            ("wxid_owner", "wxid_alice", "Alice", json.dumps({
+                "微信昵称": "Alice", "群昵称": "群内名", "性别": "女", "地区": "福建厦门",
+                "年龄_出生年份": "94", "理想型": "靠谱的人", "是否有对象": "无",
+            }, ensure_ascii=False)),
+        )
+        con.commit()
+        results, scanned, matched, truncated = member_edit.query(
+            con, "wxid_owner", {"地区": "厦门", "年份从": "90", "年份到": "99"}, [], 30,
+        )
+        assert scanned == 1 and matched == 1 and not truncated
+        assert results[0]["微信昵称"] == "Alice" and results[0]["群昵称"] == "群内名"
+        assert member_edit.query(con, "wxid_someone_else", {}, [], 30)[0] == []
+        con.execute(
+            "INSERT INTO member_details(account,member_id,name,details) VALUES(?,?,?,?)",
+            ("wxid_other", "wxid_bob", "Bob", json.dumps({"微信昵称": "Bob"})),
+        )
+        con.commit()
+        assert member_edit.query(con, "wxid_owner", {}, [], 30)[0][0]["微信昵称"] == "Alice"
+        assert member_edit.query(con, "wxid_other", {}, [], 30)[0][0]["微信昵称"] == "Bob"
+        con.execute(
+            "INSERT INTO member_details(account,member_id,name,details) VALUES(?,?,?,?)",
+            ("wxid_owner", "wxid_alice_two", "Alice", json.dumps({"微信昵称": "Alice"})),
+        )
+        con.commit()
+        limited, scanned, matched, truncated = member_edit.query(con, "wxid_owner", {}, [], 1)
+        assert scanned == 2 and matched == 2 and truncated and len(limited) == 1
+        con.close()
+        con = None
+
+        def call(payload):
+            previous = sys.stdin
+            output = io.StringIO()
+            try:
+                sys.stdin = io.StringIO(json.dumps({"数据库": str(db), "账号": "wxid_owner", **payload}))
+                with contextlib.redirect_stdout(output):
+                    code = member_edit.main()
+            finally:
+                sys.stdin = previous
+            return code, json.loads(output.getvalue())
+
+        code, response = call({"动作": "改", "主人": True, "名": "Alice", "字段": "星座", "值": "天秤座"})
+        assert code != 0 and "重名" in response["说"]
+        code, response = call({"动作": "改", "主人": True, "名": "wxid_alice", "字段": "星座", "值": "天秤座"})
+        assert code == 0 and response["ok"]
+        con = sqlite3.connect(db)
+        saved = json.loads(con.execute("SELECT details FROM member_details WHERE member_id='wxid_alice'").fetchone()[0])
+        assert saved["星座"] == "天秤座" and saved["地区"] == "福建厦门"
+        con.close()
+
+        code, response = call({"动作": "改", "名": "wxid_alice", "字段": "MBTI", "值": "INTJ"})
+        assert code != 0 and not response["ok"]
+        code, response = call({"动作": "改", "主人": True, "名": "wxid_new", "字段": "MBTI", "值": "INTJ", "模式": "upsert"})
+        assert code == 0 and response["ok"]
+        code, response = call({"动作": "改", "主人": True, "名": "New Name", "字段": "MBTI", "值": "INTJ", "模式": "upsert"})
+        assert code != 0 and not response["ok"]
+        code, response = call({"动作": "改", "名": "wxid_alice", "字段": "微信昵称", "值": "Other"})
+        assert code != 0 and not response["ok"]
+    print("SQLite member-details query/update/upsert/authorization regression passed")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     run()

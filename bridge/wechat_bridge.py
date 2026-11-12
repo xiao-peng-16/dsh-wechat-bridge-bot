@@ -103,7 +103,6 @@ CFG = {
     "记忆密钥": "",
     "记忆模型": "deepseek-flash",
     "记忆地址": "https://api.deepseek.com",
-    "群友表": "",
     "主人": [],
     "屏蔽": [],
 }
@@ -160,7 +159,6 @@ def refresh_config():
             "记忆模型": str(c.get("记忆模型") or "deepseek-flash").strip() or "deepseek-flash",
             "记忆地址": (str(c.get("记忆地址") or "https://api.deepseek.com").strip()
                          or "https://api.deepseek.com").rstrip("/"),
-            "群友表": str(c.get("群友表") or "").strip(),
             "唤醒词": [str(x).strip() for x in (c.get("唤醒词") or []) if str(x).strip()],
             # 话题规则是 {词, 回} 的对象数组（老配置是「词 = 怎么回」的字符串），原样收着，
             # 别在这里 str() —— 那样 dict 会被转成 "{'词': ...}" 一串字，后面永远匹配不上。
@@ -312,6 +310,7 @@ def main():
         return 2
     me = backend.account_id()
     log("当前账号 wxid：", me)
+    http_json("/dsh-wechat-bridge/state", {"账号": me})
     try:
         info = backend.self_info()
         log("昵称：", info.get("nick_name") or info.get("remark") or "?")
@@ -2605,6 +2604,10 @@ def main():
             "profile TEXT DEFAULT '', affinity REAL DEFAULT 0, updated_at REAL DEFAULT 0,"
             "PRIMARY KEY(account, group_id, member_id))")
         con.execute(
+            "CREATE TABLE IF NOT EXISTS member_details("
+            "account TEXT, member_id TEXT, name TEXT DEFAULT '', details TEXT DEFAULT '{}',"
+            "updated_at REAL DEFAULT 0, PRIMARY KEY(account, member_id))")
+        con.execute(
             "CREATE TABLE IF NOT EXISTS events("
             "id INTEGER PRIMARY KEY AUTOINCREMENT,"
             "account TEXT, group_id TEXT, member_id TEXT, name TEXT,"
@@ -2773,115 +2776,8 @@ def main():
                 log("画像线程出错：", repr(e))
             time.sleep(6 * 3600)
 
-    # ---------- 群友自助改资料 ----------
-    #
-    # 权限：主人能改所有人（走 DSH 模型 + 文件工具）；群友只能改 / 补自己那一行。
-    # 这里直接由桥接处理，不经过模型 —— 免得被套话「帮我把某某的改成」。
-
-    _星名们 = ("白羊", "金牛", "双子", "巨蟹", "狮子", "处女", "天秤", "天蝎", "射手", "摩羯", "水瓶", "双鱼")
-    _MBTI_RE = re.compile(r"\b([EI][NS][TF][JP])\b", re.I)
-
-    def _群友表路径():
-        """优先用宿主下发的配置；宿主还是旧版时读配置文件；都没有就用工作区里那张表。"""
-        p = str(CFG.get("群友表") or "").strip()
-        if p:
-            return p
-        home = os.environ.get("DSH_HOME") or os.path.join(os.path.expanduser("~"), ".dsh")
-        try:
-            with open(os.path.join(home, "wechat-bridge-config.json"), encoding="utf-8-sig") as f:
-                p = str((json.load(f) or {}).get("群友表") or "").strip()
-        except Exception:
-            p = ""
-        if p:
-            return p
-        # 兜底：仓库上一级（工作区）里那张群友信息表
-        try:
-            工作区 = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-            默认 = os.path.join(工作区, "群友信息表.xlsx")
-            if os.path.exists(默认):
-                return 默认
-        except Exception:
-            pass
-        return ""
-
-    def _改群友资料(wxid, name, text, group_nickname=""):
-        """解析群友自述并同步当前群名片到资料表，返回改动摘要。"""
-        path = _群友表路径()
-        if not path or not os.path.exists(path):
-            return ""
-        s = str(text or "")
-        改 = {}
-        if group_nickname:
-            改["群昵称"] = str(group_nickname).strip()
-
-        for 星 in _星名们:
-            if 星 in s:
-                改["星座"] = 星 + "座"
-                break
-        mb = [m.upper() for m in _MBTI_RE.findall(s)]
-        if mb:
-            改["MBTI"] = " / ".join(dict.fromkeys(mb))
-        # 年龄列存的是出生年份后两位：「92 年」直接写 92；「27 岁」按今年换算
-        m = re.search(r"((?:19|20)\d{2})\s*年", s)
-        if m:
-            改["年龄_出生年份"] = m.group(1)[-2:]
-        else:
-            m = re.search(r"(\d{2})\s*年(?:的|出生|生)?", s)
-            if m:
-                改["年龄_出生年份"] = m.group(1)
-            else:
-                m = re.search(r"(\d{2})\s*岁", s)
-                if m and 10 <= int(m.group(1)) <= 60:
-                    改["年龄_出生年份"] = "%02d" % ((time.localtime().tm_year - int(m.group(1))) % 100)
-        if re.search(r"我是(?:个)?男|男的|男生", s):
-            改["性别"] = "男"
-        elif re.search(r"我是(?:个)?女|女的|女生", s):
-            改["性别"] = "女"
-        m = re.search(r"(\d{3})\s*(?:cm|厘米|公分)", s, re.I)
-        if m:
-            改["身高"] = m.group(1) + "cm"
-        for 学 in ("博士", "硕士", "研究生", "本科", "大专", "高中"):
-            if 学 in s:
-                改["学历"] = 学
-                break
-
-        if not 改:
-            return ""
-        try:
-            from openpyxl import load_workbook
-
-            wb = load_workbook(path)
-            ws = wb.active
-            表头 = {str(c.value or "").strip(): c.column for c in ws[1] if str(c.value or "").strip()}
-            wxid列 = 表头.get("wxid")
-            昵称列 = 表头.get("微信昵称", 表头.get("昵称"))
-            群昵称列 = 表头.get("群昵称")
-            if group_nickname and 群昵称列:
-                改["群昵称"] = str(group_nickname).strip()
-            from member_identity import find_member_row
-            行号 = find_member_row(ws, wxid, name, group_nickname)
-            if 行号 is None:
-                行号 = ws.max_row + 1
-                if wxid列:
-                    ws.cell(row=行号, column=wxid列, value=wxid or None)
-                if 昵称列:
-                    ws.cell(row=行号, column=昵称列, value=name or None)
-            if wxid列 and wxid and not ws.cell(行号, wxid列).value:
-                ws.cell(行号, wxid列, wxid)
-            from group_profile import extract_group_profile
-            for 键, 值 in extract_group_profile(group_nickname).items():
-                if 键 in 表头 and ws.cell(行号, 表头[键]).value in (None, "") and 键 not in 改:
-                    改[键] = 值
-            改了 = []
-            for 键, 值 in 改.items():
-                if 键 in 表头:
-                    ws.cell(row=行号, column=表头[键], value=值)
-                    改了.append("%s=%s" % (键, 值))
-            wb.save(path)
-            return "、".join(改了)
-        except Exception as e:
-            log("改群友表失败：", repr(e))
-            return ""
+    # ---------- 群友自述资料 ----------
+    # 不再把聊天里的自述自动写入长期资料；资料仅通过受权限控制的工具显式修改。
 
     # ---------- 看图：老宿主自己看，新宿主交给它看 ----------
 
@@ -3176,9 +3072,6 @@ def main():
             if group_nickname:
                 nickname = group_nickname
             原话 = content
-            if is_group and sender and group_nickname:
-                _改群友资料(sender, wechat_nickname, "", group_nickname)
-
             # 追话计数：本鱼在这个群说完话后，数一数后面跟了几句（发完回复就清零）
             if is_group:
                 追话计数[chat] = 追话计数.get(chat, 0) + 1
@@ -3278,12 +3171,6 @@ def main():
                         and not 频率允许(chat, 命中[0] if 命中 else "",
                                          命中[2] if 命中 else 0, 命中[3] if 命中 else 0)):
                     return
-                # 群友自述资料：只改他自己那行（主人另走模型，能改所有人）
-                if not is_master(sender, nickname):
-                    改了 = _改群友资料(sender, wechat_nickname, raw, group_nickname)
-                    if 改了:
-                        log("群友自助改资料：%s → %s" % (nickname, 改了))
-                        content = "（已按他自己的话更新了群友信息表：%s）\n%s" % (改了, content)
                 prefix = group_context(username, chat, CFG["群上下文条数"])
                 # 记忆：先记这一笔（谁在跟本鱼互动），再把对这个人的印象 / 群像拼进上下文
                 if 引用自本鱼:
@@ -3506,7 +3393,7 @@ def main():
                     if chat.endswith('@chatroom'):
                         groups.add(chat)
                 try:
-                    recent = http_json('/dsh-wechat-bridge/state')
+                    recent = http_json('/dsh-wechat-bridge/state', {"账号": me})
                     for item in recent.get('最近聊天') or []:
                         cid = str(item.get('id') or '').strip()
                         if cid.endswith('@chatroom'):
@@ -3570,7 +3457,7 @@ def main():
     else:
         log("没配记忆密钥，画像合成跳过（好感账本照常工作）")
 
-    st = http_json("/dsh-wechat-bridge/state")
+    st = http_json("/dsh-wechat-bridge/state", {"账号": me})
     if st.get("ok"):
         try:
             段 = [int(x) for x in str(st.get("版本") or "1.1.0").split(".")[:3]]

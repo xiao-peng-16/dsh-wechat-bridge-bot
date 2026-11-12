@@ -4,6 +4,7 @@ import { join } from 'node:path'
 
 // Isolate before importing host.js, which captures DSH_HOME at module evaluation.
 process.env.DSH_HOME = mkdtempSync(join(process.cwd(), '.selftest-home-'))
+const testPython = process.env.DSH_TEST_PYTHON || ''
 const { apply } = await import('./lib/host.js')
 const 家 = process.env.DSH_HOME
 const 配置路径 = join(家, 'wechat-bridge-config.json')
@@ -11,7 +12,7 @@ const 聊天路径 = join(家, 'wechat-bridge-chats.json')
 
 writeFileSync(
   配置路径,
-  JSON.stringify({ 总开关: true, 试运行: false, 默认会话: 'session-aaa', 绑定: [], 屏蔽: ['微信运动'] }, null, 2),
+  JSON.stringify({ 总开关: true, 试运行: false, 默认会话: 'session-aaa', 绑定: [], 屏蔽: ['微信运动'], 解释器: testPython }, null, 2),
   'utf8',
 )
 // 上一轮留下的「最近聊天」要清掉，不然「一开始是空的」这条永远过不去
@@ -225,4 +226,24 @@ await 调('/dsh-wechat-bridge/receive', {
   sender: 'wxid_owner', senderId: 'wxid_stranger',
 })
 断言('昵称冒充主人仍被拦截', typeof 阀({ name: 'pwsh' }) === 'string')
+
+// Member queries may run in a guest round; writes must not.
+const 成员 = 工具.find((t) => t.name === 'wechat_member_update')
+const 无账号 = await 成员.execute({ 动作: '查' })
+断言('未连接微信账号时不能查资料', 无账号.ok === false, 无账号)
+await 调('/dsh-wechat-bridge/state', { 账号: 'wxid_test_account' })
+const 外人改 = await 成员.execute({ 动作: '改', 昵称: 'wxid_alice', 字段: '地区', 值: '上海', 模式: 'upsert' })
+断言('外人不能改成员资料', 外人改.ok === false && /主人/.test(外人改.说), 外人改)
+if (testPython) {
+  const 外人查 = await 成员.execute({ 动作: '查' })
+  断言('外人能查询成员资料', 外人查.ok === true && 外人查.人数 === 0, 外人查)
+  await 调('/dsh-wechat-bridge/receive', {
+    text: '主人修改资料', chat: '测试群', chatId: '123@chatroom', chatType: 'group',
+    sender: '主人', senderId: 'wxid_owner',
+  })
+  const 主人改 = await 成员.execute({ 动作: '改', 昵称: 'wxid_alice', 字段: '地区', 值: '上海', 模式: 'upsert' })
+  断言('主人修改资料成功', 主人改.ok === true, 主人改)
+  const 查询 = await 成员.execute({ 动作: '查', 地区: '上海' })
+  断言('更新后能查到资料', 查询.ok === true && 查询.人数 === 1, 查询)
+}
 console.log('\n日志尾巴：\n' + String(屏.日志 || '').split('\n').slice(-4).join('\n'))
