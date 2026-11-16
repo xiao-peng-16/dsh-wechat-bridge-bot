@@ -17,6 +17,7 @@ def run():
         assert render('欢迎 {昵称}（{微信昵称}） {wxid} {人数}',group_nickname='卡片',wechat_nickname='昵称',wxid='c',count=2)=='欢迎 卡片（昵称） c 2'
         assert render('{昵称}', group_nickname='', wechat_nickname='微信名') == '微信名'
         assert render_lines('第一条 {昵称}\n\n第二条 {人数}', group_nickname='卡片', wechat_nickname='微信名', count=2) == ['第一条 卡片', '第二条 2']
+        assert render_lines('{昵称} 已离开群聊（共 {人数} 人）', group_nickname='群甲、群乙、群丙', count=3) == ['群甲、群乙、群丙 已离开群聊（共 3 人）']
         assert snapshot_path(d,'room/a').endswith('room_a.json')
     print('member snapshot regression passed')
 if __name__=='__main__':run()

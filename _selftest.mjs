@@ -167,6 +167,78 @@ const 收2 = await 调('/dsh-wechat-bridge/receive', {
 })
 断言('单独绑定的群进了自己那间', 收2.ok === true && 收到的[0]?.id === 'session-bbb', { 收2, 收到: 收到的.map((x) => x.id) })
 
+// 每群规则：关闭后不进入 AI，仅明确点名才收到固定回复。
+await 调('/dsh-wechat-bridge/save', { ...读配置(), 群回复间隔秒: 60,
+  群聊管理: [{ 群: '456@chatroom', 所有人可聊: false, 固定回复: '请联系群主' }] })
+断言('群规则落盘', 读配置().群聊管理[0].固定回复 === '请联系群主')
+const 全局默认 = 读配置()
+await 调('/dsh-wechat-bridge/save', { ...全局默认, 群聊管理: [
+  { 群: '改名后的群', 所有人可聊: true },
+  { 群: '456@chatroom', 所有人可聊: false, 固定回复: '请联系群主',
+    群上下文条数: 0, 群里只认点名: false, 追话句数: 0,
+    点名别名: ['只在这个群叫'], 话题规则: [], 群回复间隔秒: 0,
+    日记: false, 成员快照: false, 入群提醒: '', 退群提醒: '', 总结提示词: '' },
+] })
+const 覆盖 = 读配置()
+断言('逐群字段保存且全局默认不变', 覆盖.群聊管理[1].群上下文条数 === 0
+  && 覆盖.群聊管理[1].群回复间隔秒 === 0 && 覆盖.群聊管理[1].日记 === false
+  && 覆盖.群聊管理[1].话题规则.length === 0 && 覆盖.群里只认点名 === 全局默认.群里只认点名)
+断言('同名与 ID 规则并存', 覆盖.群聊管理.length === 2)
+断言('旧布尔权限迁移为三档模式', 覆盖.群聊管理[0].群聊权限 === '所有人可以聊'
+  && 覆盖.群聊管理[1].群聊权限 === '所有人不可以聊')
+const 群消息 = (补 = {}) => ({ text: '在吗', chat: '改名后的群', chatId: '456@chatroom',
+  chatType: 'group', sender: '李四', senderId: 'wxid_lisi', ...补 })
+const 入队前 = (await 屏.概况()).待发队列
+const 模型前 = 收到的.length
+const 未点名 = await 调('/dsh-wechat-bridge/receive', 群消息({ atMe: false, 话题命中: true }))
+断言('受限群未点名不进 AI 也不回复', !未点名.ok && 收到的.length === 模型前 && (await 屏.概况()).待发队列 === 入队前)
+const 固定 = await 调('/dsh-wechat-bridge/receive', 群消息({ atMe: true, text: '用量' }))
+断言('受限群点名仅排固定回复', 固定.ok && 收到的.length === 模型前 && (await 屏.概况()).待发队列 === 入队前 + 1, 固定)
+const 冷却 = await 调('/dsh-wechat-bridge/receive', 群消息({ atMe: true }))
+断言('群 ID 规则优先、独立冷却 0 生效', 冷却.ok && 收到的.length === 模型前
+  && (await 屏.概况()).待发队列 === 入队前 + 2, 冷却)
+await 调('/dsh-wechat-bridge/save', { ...读配置(), 入站白名单: ['wxid_another'] })
+const 白名单拦截 = await 调('/dsh-wechat-bridge/receive', 群消息({ atMe: true }))
+断言('白名单先于固定回复', !白名单拦截.ok && /白名单/.test(白名单拦截.说), 白名单拦截)
+await 调('/dsh-wechat-bridge/save', { ...读配置(), 入站白名单: [],
+  群聊管理: [{ 群: '456@chatroom', 群聊权限: '仅白名单可聊', 群白名单: ['wxid_alice', '小明'], 固定回复: '请联系群主', 群里只认点名: false, 群回复间隔秒: 0 }] })
+断言('逐群白名单保存并与全局名单隔离', 读配置().群聊管理[0].群白名单.join('|') === 'wxid_alice|小明'
+  && 读配置().入站白名单.length === 0)
+const 白名单前 = 收到的.length
+const 白名单队列前 = (await 屏.概况()).待发队列
+const 白名单放行 = await 调('/dsh-wechat-bridge/receive', 群消息({ senderId: 'wxid_alice', atMe: true }))
+断言('白名单 wxid 可与 AI 聊天', 白名单放行.ok && 收到的.length === 白名单前 + 1, 白名单放行)
+const 昵称放行 = await 调('/dsh-wechat-bridge/receive', 群消息({ sender: '小明', senderId: 'wxid_ming', atMe: true }))
+断言('白名单昵称可与 AI 聊天', 昵称放行.ok && 收到的.length === 白名单前 + 2, 昵称放行)
+const 非白名单 = await 调('/dsh-wechat-bridge/receive', 群消息({ atMe: true }))
+断言('非白名单点名只得到固定回复', 非白名单.ok && 收到的.length === 白名单前 + 2
+  && (await 屏.概况()).待发队列 === 白名单队列前 + 1, 非白名单)
+const 非白名单未点名 = await 调('/dsh-wechat-bridge/receive', 群消息({ atMe: false }))
+断言('非白名单未点名静默', !非白名单未点名.ok && 收到的.length === 白名单前 + 2, 非白名单未点名)
+await 调('/dsh-wechat-bridge/save', { ...读配置(), 主人: ['wxid_owner'],
+  群聊管理: [{ 群: '456@chatroom', 群聊权限: '仅白名单可聊', 群白名单: [], 固定回复: '', 群里只认点名: false }] })
+const 空名单陌生人 = await 调('/dsh-wechat-bridge/receive', 群消息({ atMe: true }))
+断言('空群白名单不放行陌生人', !空名单陌生人.ok && 收到的.length === 白名单前 + 2, 空名单陌生人)
+const 空名单主人 = await 调('/dsh-wechat-bridge/receive', 群消息({ sender: '主人', senderId: 'wxid_owner', atMe: true }))
+断言('空群白名单仍放行主人', 空名单主人.ok && 收到的.length === 白名单前 + 3, 空名单主人)
+await 调('/dsh-wechat-bridge/save', { ...读配置(),
+  群聊管理: [{ 群: '456@chatroom', 所有人可聊: false, 固定回复: '' }] })
+const 预期队列 = (await 屏.概况()).待发队列
+const 空回复 = await 调('/dsh-wechat-bridge/receive', 群消息({ atMe: true }))
+断言('空固定回复保持静默', !空回复.ok && (await 屏.概况()).待发队列 === 预期队列, 空回复)
+await 调('/dsh-wechat-bridge/save', { ...读配置(), 试运行: true,
+  群聊管理: [{ 群: '456@chatroom', 所有人可聊: false, 固定回复: '试运行回复' }] })
+const 试回复 = await 调('/dsh-wechat-bridge/receive', 群消息({ atMe: true }))
+断言('试运行只记录不入队', 试回复.ok && (await 屏.概况()).待发队列 === 预期队列, 试回复)
+await 调('/dsh-wechat-bridge/save', { ...读配置(), 试运行: false,
+  群聊管理: [{ 群: '456@chatroom', 所有人可聊: false, 固定回复: '请联系群主' }] })
+const 别群 = await 调('/dsh-wechat-bridge/receive', 群消息({ chat: '另一群', chatId: '789@chatroom', atMe: true }))
+断言('未配置的群沿用原有行为', 别群.ok && 收到的.length === 白名单前 + 4, 别群)
+await 调('/dsh-wechat-bridge/save', { ...读配置(), 主人: ['wxid_owner'] })
+const 主人群 = await 调('/dsh-wechat-bridge/receive', 群消息({ sender: '主人', senderId: 'wxid_owner', atMe: true }))
+断言('受限群主人仍进入 AI', 主人群.ok && 收到的.length === 白名单前 + 5, 主人群)
+await 调('/dsh-wechat-bridge/save', { ...读配置(), 群聊管理: [], 群回复间隔秒: 30 })
+
 // 7 最近聊过谁被记下来了
 const 概2 = await 屏.概况()
 const 名 = 概2.最近聊天.map((x) => x.名)

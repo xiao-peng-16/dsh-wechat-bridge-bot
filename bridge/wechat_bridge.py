@@ -93,6 +93,8 @@ CFG = {
     "群上下文条数": 6,
     "群里只认点名": True,
     "追话句数": 3,
+    "点名别名": [],
+    "群聊管理": [],
     "每条字数上限": 60,
     "每条最多几条": 3,
     "日记": True,
@@ -145,6 +147,7 @@ def refresh_config():
         CFG = {
             "后端": str(c.get("后端") or "sqlite_uia").strip().lower() or "sqlite_uia",
             "群上下文条数": max(0, min(50, int(c.get("群上下文条数") or 0))),
+            "点名别名": 别名,
             "群里只认点名": bool(c.get("群里只认点名", True)),
             # 老宿主还没有这个字段时按 3 算（默认开）；明确填 0 才是关
             "追话句数": (3 if c.get("追话句数") is None
@@ -167,6 +170,7 @@ def refresh_config():
             "屏蔽": [str(x).strip() for x in (c.get("屏蔽") or []) if str(x).strip()],
             "群回复间隔秒": max(0.0, float(c.get("群回复间隔秒") or 0)),
             "绑定": c.get("绑定") or [],
+            "群聊管理": c.get("群聊管理") if isinstance(c.get("群聊管理"), list) else [],
             "成员快照": bool(c.get("成员快照", True)),
             "成员快照秒": max(10.0, min(3600.0, float(c.get("成员快照秒") or 30))),
             "入群提醒": str(c.get("入群提醒") or "").strip(),
@@ -178,6 +182,51 @@ def refresh_config():
     except Exception as e:
         log("解析配置失败：", repr(e))
         return False
+
+
+_群专属字段 = (
+    "群里只认点名", "追话句数", "群上下文条数", "点名别名", "话题规则",
+    "群回复间隔秒", "日记", "总结提示词", "成员快照", "入群提醒", "退群提醒",
+)
+
+
+def _群规则(group_id, group_name, config=None):
+    """按群底层 ID 优先、显示名其次取规则；未命中返回空字典。"""
+    config = config if isinstance(config, dict) else CFG
+    rules = config.get("群聊管理") or []
+    gid, gname = str(group_id or "").strip(), str(group_name or "").strip()
+    for wanted in (gid, gname):
+        if not wanted:
+            continue
+        for rule in rules:
+            if isinstance(rule, dict) and str(rule.get("群") or "").strip() == wanted:
+                return rule
+    return {}
+
+
+def group_sender_allowed(rule, sender_id, nickname, owner=False):
+    if owner or not rule:
+        return True
+    mode = rule.get("群聊权限") or ("所有人不可以聊" if rule.get("所有人可聊") is False else "所有人可以聊")
+    if mode == "所有人不可以聊":
+        return False
+    if mode == "仅白名单可聊":
+        members = rule.get("群白名单") or []
+        return bool((sender_id and sender_id in members) or (nickname and nickname in members))
+    return True
+
+
+def resolve_group_settings(group_id, group_name, config=None, aliases=None):
+    """返回某群的有效设置，规则字段按属性存在性覆盖全局值。"""
+    config = config if isinstance(config, dict) else CFG
+    base_aliases = aliases if aliases is not None else (config.get("点名别名") or ALIASES)
+    values = {key: config.get(key) for key in _群专属字段}
+    values["点名别名"] = list(base_aliases or [])
+    rule = _群规则(group_id, group_name, config)
+    for key in _群专属字段:
+        if key in rule:
+            values[key] = rule[key]
+    return values
 
 
 def parse_args():
@@ -379,11 +428,12 @@ def main():
         except Exception:
             pass
 
-    def 频率允许(chat, 词="", 窗口=0, 次数=0):
+    def 频率允许(chat, 词="", 窗口=0, 次数=0, 设置=None):
         """同一个群、同一个话题词各算各的冷却：A 词刚接过，不该拦着 B 词。
         每个词还能自己配「窗口秒内最多几次」——配了就以它为准，不再叠全局间隔；
         没配（窗口/次数为 0）才用全局「群回复间隔秒」。"""
-        gap = CFG.get("群回复间隔秒") or 0
+        gap = (设置 or {}).get("群回复间隔秒") if 设置 is not None else CFG.get("群回复间隔秒")
+        gap = gap or 0
         if 窗口 and 次数:
             # 词自己配了「窗口秒内最多几次」，就以它为准，全局间隔别再叠一道
             gap = 0
@@ -424,14 +474,14 @@ def main():
         # 主人权限只认 sender wxid，改昵称或群名片不能冒领。
         return bool(sender_id and sender_id in CFG["主人"])
 
-    def diary_path(chat):
-        base = CFG["日记目录"] or os.path.join(os.path.expanduser("~"), ".dsh", "wechat-diary")
+    def diary_path(chat, 设置=None):
+        base = ((设置 or {}).get("日记目录") if 设置 is not None else CFG.get("日记目录")) or os.path.join(os.path.expanduser("~"), ".dsh", "wechat-diary")
         day = time.strftime("%Y-%m-%d")
         safe = re.sub(r'[\\/:*?"<>|\s]+', "_", chat).strip("_")[:60] or "群"
         return os.path.join(base, day, safe + ".md")
 
-    def diary_append(chat, ts, who, content):
-        p = diary_path(chat)
+    def diary_append(chat, ts, who, content, 设置=None):
+        p = diary_path(chat, 设置)
         try:
             os.makedirs(os.path.dirname(p), exist_ok=True)
             new = not os.path.exists(p)
@@ -3065,6 +3115,7 @@ def main():
             except Exception:
                 pass
             is_group = str(username).endswith("@chatroom")
+            群设置 = resolve_group_settings(username, chat) if is_group else None
             wechat_nickname = nickname
             if is_group:
                 display_name(sender, username)  # Populate the per-group raw card cache.
@@ -3081,8 +3132,8 @@ def main():
                 return
 
             # 群聊记日记 —— 不管点没点名都记，这是「群里的记忆」
-            if is_group and CFG["日记"]:
-                diary_append(chat, create_time, nickname or "某人", content)
+            if is_group and 群设置.get("日记", CFG.get("日记", True)):
+                diary_append(chat, create_time, nickname or "某人", content, 群设置)
 
             # 群里：要不要接「没点名」的闲聊，看设置「群里只认点名」（默认开 = 只在叫到名字时进 DSH）
             at_me = bool(pat_actor)
@@ -3090,14 +3141,36 @@ def main():
             追话命中 = False
             命中 = None
             if is_group:
-                at_me = bool(pat_actor) or any(a in raw for a in ALIASES) or 引用自本鱼
+                at_me = bool(pat_actor) or any(a in raw for a in (群设置.get("点名别名") or [])) or 引用自本鱼
+                群规则 = _群规则(username, chat)
+                if not group_sender_allowed(群规则, sender, nickname, is_master(sender, nickname)):
+                    if not at_me:
+                        return
+                    # 交给宿主排固定回复；不运行话题/追话/记忆/图片/总结等 AI 处理。
+                    待回复.setdefault(chat, []).append({
+                        "id": sender, "chatroom_id": username, "name": nickname or "",
+                        "quote": _消息正文(raw)[:24],
+                        "native_message_id": str(msg.get("native_message_id") or ""),
+                        "ts": time.time(),
+                    })
+                    待回复[chat] = 待回复[chat][-12:]
+                    r = http_json("/dsh-wechat-bridge/receive", {
+                        "text": 原话, "event": "pat" if pat_actor else "",
+                        "chat": chat, "chatId": username, "chatType": "group",
+                        "sender": nickname or "群里的人", "senderId": sender,
+                        "nativeMessageId": str(msg.get("native_message_id") or ""),
+                        "atMe": True,
+                    })
+                    if not r.get("ok"):
+                        log("群固定回复未排队（%s）：%s" % (chat, r.get("说")))
+                    return
                 if 引用自本鱼:
                     log("引用本鱼：%s 引用了「%s」" % (sender, 引用原话[:40]))
                 # 话题规则：一条是 {词, 回}。命中哪条就把那条的写法塞给模型，
                 # 比统一一句「想接就接」有分寸 —— 提到白饭和提到骂人，接法不该一样。
                 # 老配置里存的是「词 = 怎么回」的字符串，也认。
                 规则 = []
-                for 项 in (CFG.get("话题规则") or []):
+                for 项 in (群设置.get("话题规则") or []):
                     if isinstance(项, dict):
                         # 每条规则前面有个复选框：关掉的这条直接不参与匹配
                         if 项.get("启用") is False:
@@ -3135,7 +3208,7 @@ def main():
                     bool(CFG.get("唤醒词"))
                     and any(str(w).strip() in raw for w in CFG["唤醒词"] if str(w).strip())
                 )
-                只认点名 = bool(CFG.get("群里只认点名", True))
+                只认点名 = bool(群设置.get("群里只认点名", True))
                 # 只认点名：没喊名字、也没踩到话题词的一律不进 DSH —— 日记照记、群上下文照攒。
                 # 关掉：主人说话 / 活跃群 也算叫到（老行为），再吃频率闸。
                 called = at_me or 话题命中 or (
@@ -3145,9 +3218,9 @@ def main():
                 # 追话：本鱼刚在这个群说完话，后面 N 句里进来的消息很可能是接话的。
                 # 交给认领判断过一遍，明确了才回；看不出就不回（保守，不乱插嘴）。
                 if not called:
-                    追话句数 = int(CFG.get("追话句数") or 0)
+                    追话句数 = int(群设置.get("追话句数") or 0)
                     if 追话句数 > 0 and 追话计数.get(chat, 0) <= 追话句数:
-                        判断 = 认领判断(content, nickname, group_context(username, chat, 6),
+                        判断 = 认领判断(content, nickname, group_context(username, chat, int(群设置.get("群上下文条数") or 0)),
                                      最后回复.get(chat, ""))
                         log("追话判断（%s 第 %d 句）：%s「%s」→ %s"
                             % (chat, 追话计数.get(chat, 0), nickname or "某人",
@@ -3169,9 +3242,9 @@ def main():
                 # 不该被 30 秒冷却挡掉。
                 if (not at_me and not pat_actor and not 追话命中
                         and not 频率允许(chat, 命中[0] if 命中 else "",
-                                         命中[2] if 命中 else 0, 命中[3] if 命中 else 0)):
+                                         命中[2] if 命中 else 0, 命中[3] if 命中 else 0, 群设置)):
                     return
-                prefix = group_context(username, chat, CFG["群上下文条数"])
+                prefix = group_context(username, chat, int(群设置.get("群上下文条数") or 0))
                 # 记忆：先记这一笔（谁在跟本鱼互动），再把对这个人的印象 / 群像拼进上下文
                 if 引用自本鱼:
                     记事件(me or "", chat, sender, nickname, "引用", raw, 引用原话)
@@ -3259,7 +3332,8 @@ def main():
                     ]
                     行们 = 历史转文字(历史, chatroom_username=username if str(username).endswith("@chatroom") else "")
                     if 行们:
-                        指导 = str(CFG.get("总结提示词") or "").strip() or DEFAULT_SUMMARY_GUIDE
+                        指导来源 = 群设置 if 群设置 is not None else CFG
+                        指导 = str(指导来源.get("总结提示词") or "").strip() or DEFAULT_SUMMARY_GUIDE
                         content = (
                             "（按设置：下面是从微信消息库里按时间直接取出的「%s」记录，"
                             "共 %d 行（同一个人 90 秒内的连发已合并成一行）。"
@@ -3401,6 +3475,9 @@ def main():
                 except Exception:
                     pass
                 for group in groups:
+                    group_settings = resolve_group_settings(group, display_name(group))
+                    if not group_settings.get('成员快照', True):
+                        continue
                     members = db.get_group_members(group) or []
                     card_map = {}
                     try:
@@ -3427,23 +3504,29 @@ def main():
                         m = by_id.get(uid, {})
                         card = display_name(uid, group)
                         nick = str(m.get('nick_name') or '').strip()
-                        texts = render_lines(CFG.get('入群提醒') or '', group=display_name(group), group_nickname=card,
+                        texts = render_lines(group_settings.get('入群提醒') or '', group=display_name(group), group_nickname=card,
                                               wechat_nickname=nick, wxid=uid, count=len(current))
                         for text in texts:
                             http_json('/dsh-wechat-bridge/send', {'聊天': display_name(group), '文本': text})
                         if texts:
                             log('检测到入群：%s → %s（%d 条）' % (group, uid, len(texts)))
-                    for uid in sorted(removed):
-                        old = previous.get(uid) or {}
-                        old_card = str(old.get('群昵称') or '').strip()
-                        old_nick = str(old.get('微信昵称') or '').strip()
-                        texts = render_lines(CFG.get('退群提醒') or '', group=display_name(group),
-                                              group_nickname=old_card, wechat_nickname=old_nick,
-                                              wxid=uid, count=len(current))
+                    if removed:
+                        # 同一轮扫描可能同时退了多人：先合并变量，再按模板行各发一次，避免逐人刷屏。
+                        removed_rows = [(uid, previous.get(uid) or {}) for uid in sorted(removed)]
+                        cards = [str(old.get('群昵称') or '').strip() for _, old in removed_rows]
+                        nicks = [str(old.get('微信昵称') or '').strip() for _, old in removed_rows]
+                        ids = [uid for uid, _ in removed_rows]
+                        mention_names = [card or nick for card, nick in zip(cards, nicks)]
+                        texts = render_lines(
+                            group_settings.get('退群提醒') or '', group=display_name(group),
+                            group_nickname='、'.join(x for x in cards if x),
+                            wechat_nickname='、'.join(x for x in nicks if x),
+                            wxid='、'.join(ids), count=len(removed),
+                        )
                         for text in texts:
                             http_json('/dsh-wechat-bridge/send', {'聊天': display_name(group), '文本': text})
                         if texts:
-                            log('检测到退群：%s → %s（%d 条）' % (group, uid, len(texts)))
+                            log('检测到退群：%s → %s（%d 人，%d 条）' % (group, '、'.join(x for x in mention_names if x) or '未知成员', len(removed), len(texts)))
             except Exception:
                 log('群成员快照出错：', traceback.format_exc(limit=2))
             time.sleep(interval)

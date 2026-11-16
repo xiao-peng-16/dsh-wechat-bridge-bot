@@ -149,6 +149,8 @@ await 等()
 const 文字 = 都(树).map((n) => 绳(n)).join(' | ')
 断言('有「不回谁（屏蔽）」这一栏', 文字.includes('不回谁（屏蔽）'), 文字.slice(0, 200))
 断言('有「单独绑定」', 文字.includes('单独绑定'), 文字.slice(0, 400))
+断言('逐群编辑不在微信与群聊页', !文字.includes('群聊管理'), 文字.slice(0, 400))
+断言('有独立群聊配置页签', !!找按钮(树, '群聊配置'))
 断言('默认会话下拉选中了 session-aaa', !!都(树).find((n) => n.type === 'select' && n.props.value === 'session-aaa'), 都(树).filter((n) => n.type === 'select').map((n) => n.props.value))
 
 // 3 加一个「不回谁」
@@ -226,6 +228,42 @@ await 等()
 const 提示 = 都(树).map((n) => 绳(n)).join(' ')
 断言('半截行被拦住了（提示要补聊天名）', /缺聊天名|补上再存/.test(提示), 提示.slice(-300))
 断言('半截行没发出去', (发出去.体.绑定 || []).length === 1, 发出去.体.绑定)
+
+// 10 群聊管理独立于会话绑定：群 ID、权限、白名单和固定回复一起保存。
+const 绑定空框 = 找输入(树, '微信聊天名')
+绑定空框.props.onChange({ target: { value: '群A' } })
+树 = 重画()
+树 = 切页(树, '群聊配置')
+断言('群聊配置页有群列表', !!找按钮(树, '群A ·'))
+断言('群列表位于表单上方且不分左右栏', 都(树).some((n) => n.type === 'div' && n.props.style?.flexDirection === 'column' && n.kids?.[0]?.props.style?.flexWrap === 'wrap' && 都(n.kids?.[0]).some((k) => k.type === 'button' && 绳(k).includes('群A'))))
+断言('切页保留未保存绑定', !!找按钮(树, '保存设置'))
+找按钮(树, '群A ·').props.onClick()
+树 = 重画()
+const 权限选项 = 都(树).find((n) => n.type === 'select' && n.props.value === '所有人可以聊')
+断言('新群默认所有人可以聊', !!权限选项)
+权限选项.props.onChange({ target: { value: '仅白名单可聊' } })
+树 = 重画()
+const 群白名单输入 = 都(树).find((n) => n.type === 'textarea' && n.props.placeholder?.includes('成员 wxid'))
+断言('白名单模式显示本群名单', !!群白名单输入)
+const 混合名单 = 'wxid_alice,小明，wxid_carol\n小红'
+群白名单输入.props.onChange({ target: { value: 混合名单 } })
+树 = 重画()
+断言('输入时保留中英文逗号与换行', 都(树).find((n) => n.type === 'textarea' && n.props.placeholder?.includes('成员 wxid'))?.props.value === 混合名单)
+const 固定回复框 = 都(树).find((n) => n.type === 'textarea' && n.props.placeholder?.includes('无权限成员点名时的固定回复'))
+断言('固定回复使用多行文本框', !!固定回复框)
+固定回复框.props.onChange({ target: { value: '请联系群主\n稍后回复你' } })
+树 = 重画()
+树 = 切页(树, '微信与群聊')
+断言('离开群聊配置后仍有待保存改动', !!找按钮(树, '保存设置'))
+找按钮(树, '保存设置').props.onClick()
+await 等()
+await 等()
+树 = 重画()
+断言('每群白名单与固定回复保存成功', 发出去.体.群聊管理[0].群 === '1@chatroom'
+  && 发出去.体.群聊管理[0].群聊权限 === '仅白名单可聊'
+  && 发出去.体.群聊管理[0].所有人可聊 === false
+  && 发出去.体.群聊管理[0].群白名单.join('|') === 'wxid_alice|小明|wxid_carol|小红'
+  && 发出去.体.群聊管理[0].固定回复 === '请联系群主\n稍后回复你', 发出去.体.群聊管理)
 
 console.log('\n渲染出来的按钮：', 都(树).filter((n) => n.type === 'button').map(绳).join(' / '))
 // 设置页里有 4 秒一次的轮询，不手动退 node 会一直挂着
